@@ -1,15 +1,5 @@
 """
 Conteggio Ore & Stima Stipendio - App Streamlit
-------------------------------------------------
-Versione semplificata: inserisci direttamente le ore fatte in ogni turno
-(es. 2 ore mattina, 3.5 pranzo, 3.5 cena) e l'app tiene traccia del
-totale giornaliero, mensile e stima lo stipendio lordo in base
-alla tua paga oraria (CCNL 6° livello, valore modificabile).
-
-Dati salvati in turni.csv nella stessa cartella.
-
-Avvio:
-    streamlit run app.py
 """
 
 import streamlit as st
@@ -18,12 +8,14 @@ from datetime import date
 import os
 
 CSV_PATH = "turni.csv"
-SOGLIA_MENSILE_ORE = 173  # soglia CCNL, modificabile
+SOGLIA_MENSILE_ORE = 172  # soglia CCNL
 
-# Valore di riferimento indicativo (6° livello CCNL Turismo/Pubblici Esercizi,
-# minimo tabellare mensile / 173h). VERIFICA sulla tua busta paga la voce
-# "minimo tabellare" e aggiorna il campo nell'app se diverso.
-PAGA_ORARIA_DEFAULT = 8.56
+# Valore di riferimento indicativo (6° livello CCNL Turismo/Pubblici Esercizi, minimo tabellare mensile / 172h).
+# PAGA BASE:       937.80
+# CONDINGENZA:     520.51
+# AUMENTO dal 6/26  33.25
+# TOTALE          1491.27
+PAGA_ORARIA_DEFAULT = 8.67
 
 
 def carica_turni() -> pd.DataFrame:
