@@ -16,8 +16,8 @@ SOGLIA_MENSILE_ORE = 172  # soglia CCNL
 # CONTINGENZA:     520.51
 # AUMENTO dal 6/26  33.26
 # TOTALE          1491.27
-PAGA_ORARIA_DEFAULT = 8.67
 RETRIBUZIONE_MENSILE_DEFAULT = 1491.27
+PAGA_ORARIA_DEFAULT = RETRIBUZIONE_MENSILE_DEFAULT / SOGLIA_MENSILE_ORE
 
 # Moltiplicatori di default per le maggiorazioni.
 # NB: "Festivo" è una stima indicativa (+30%), verificala sul tuo CCNL/busta paga.
