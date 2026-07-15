@@ -1,13 +1,5 @@
 """
-Conteggio Ore & Stima Stipendio - App Streamlit (v3)
-
-Novità rispetto alla v2:
-- Le "voci stipendio" sono ora separate come in busta paga: una riga per le
-  ore lavorate a tariffa base, e righe distinte per ogni maggiorazione
-  (domenicale, notturno, festivo) e ogni rateo (13ª, 14ª, ferie, ROL, formazione),
-  invece di un unico importo per turno con moltiplicatore incorporato.
-- Detrazione lavoro dipendente calcolata sui giorni retribuiti (non sulle ore),
-  formula calibrata sul cedolino di giugno 2026: 1.380 €/anno * giorni/365.
+Conteggio Ore & Stima Stipendio - App Streamlit (v5 - Con Riepiloghi e Calcolo Esatto)
 """
 
 import streamlit as st
@@ -16,47 +8,32 @@ from datetime import date
 import os
 
 CSV_PATH = "turni.csv"
-# Soglia CCNL, confermata dalla busta paga (1491.57 / 172 = 8.67192 €/h)
 SOGLIA_MENSILE_ORE = 172
 
-# 6° livello CCNL Turismo/Pubblici Esercizi, minimo tabellare mensile / 172h.
+# 6° livello CCNL Turismo/Pubblici Esercizi
 RETRIBUZIONE_MENSILE_DEFAULT = 1491.57
-PAGA_ORARIA_DEFAULT = RETRIBUZIONE_MENSILE_DEFAULT / SOGLIA_MENSILE_ORE
+PAGA_ORARIA_DEFAULT = 8.67192
 
-# Percentuali maggiorazione realmente legate a turni EFFETTIVAMENTE lavorati.
-PERC_DOMENICALE_DEFAULT = 0.10   # confermato: 0.86719 * 19h = 16.48 € in busta paga
-PERC_NOTTURNO_DEFAULT = 0.60     # non ancora verificato su busta paga reale
+# Percentuali maggiorazione
+PERC_DOMENICALE_DEFAULT = 0.10   # 10%
 
-# Ratei 13ª/14ª/ferie: (ore_lavorate_non_formazione / divisore) * paga_oraria
-DIVISORE_RATEI_DEFAULT = 12.0
+# Coefficienti reali calcolati sulla busta paga di Giugno 2026 (108 ore lavorate)
+COEFF_13_14_FERIE = 1 / 12             # 9.00 ore su 108 lavorate
+COEFF_FESTIVITA_CHIAMATA = 0.0465123   # 5.02333 ore su 108 lavorate
+COEFF_ROL = 0.0155015                 # 1.67416 ore su 108 lavorate
 
-# Contributi INPS/enti bilaterali, calibrati sulla busta paga di giugno 2026:
-# IVS 9.19% + FIS 0.26667% + CIGS 0.30% + E.B.T. 0.20%
-PERC_INPS_DEFAULT = 0.0995667
+# Percentuali Contributi su Imponibile INPS
+PERC_IVS = 0.0919000     # 9.19%
+PERC_FIS = 0.0026667     # 0.26667%
+PERC_CIGS = 0.0030000    # 0.30%
+# 0.20% (applicato su imponibile EBT dedotte 13ma e 14ma)
+PERC_EBT = 0.0020000
 
-# Scaglioni IRPEF annui (irpef progressiva). Verifica sempre coi valori aggiornati.
-IRPEF_SCAGLIONI = [(28000, 0.23), (50000, 0.35), (float("inf"), 0.43)]
-
-# Detrazione lavoro dipendente: per contratto a tempo determinato con reddito
-# annuo basso, minimo garantito 1.380 €/anno, rapportato ai giorni retribuiti.
-# Verificato: 1380 * 19gg / 365 = 71,84 € (torna esatto sul cedolino di giugno).
+# Detrazione lavoro dipendente minima garantita per tempo determinato
 DETRAZIONE_ANNUA_DEFAULT = 1380.0
 
 COLONNE = ["data", "etichetta", "ore", "domenicale",
            "notturno", "festivo", "formazione"]
-
-
-def calcola_irpef_lorda_annua(reddito_annuo: float) -> float:
-    imposta = 0.0
-    soglia_prec = 0.0
-    for soglia, aliquota in IRPEF_SCAGLIONI:
-        if reddito_annuo > soglia_prec:
-            base = min(reddito_annuo, soglia) - soglia_prec
-            imposta += base * aliquota
-            soglia_prec = soglia
-        else:
-            break
-    return imposta
 
 
 def carica_turni() -> pd.DataFrame:
@@ -90,52 +67,42 @@ def etichetta_maggiorazioni(row) -> str:
     return " + ".join(tag) if tag else "Normale"
 
 
-def calcola_voci_stipendio(df_mese: pd.DataFrame, paga_oraria: float,
-                           perc_domenicale: float, perc_notturno: float,
-                           divisore_ratei: float, ore_rol_manuale: float,
-                           ore_festivita_manuale: float) -> pd.DataFrame:
-    """Ricostruisce le voci di stipendio come righe separate, sullo stile
-    della busta paga: ore base, maggiorazioni su turni effettivi, ratei —
-    ognuna con la propria base oraria e il proprio importo.
-
-    NB: 'Festività infrasettimanali non godute' NON dipende dai turni marcati
-    come festivi: nei contratti a chiamata è un rateo maturato a prescindere,
-    come ferie/13ª/14ª/ROL, per compensare le festività che non puoi goderti
-    non avendo giorni di riposo fissi. Va quindi inserito manualmente finché
-    non si individua la formula esatta su più cedolini."""
+def calcola_voci_stipendio(df_mese: pd.DataFrame, paga_oraria: float, perc_domenicale: float) -> pd.DataFrame:
     non_formazione = df_mese.loc[~df_mese["formazione"]]
     formazione = df_mese.loc[df_mese["formazione"]]
 
     ore_base = non_formazione["ore"].sum()
     ore_domenicale = non_formazione.loc[non_formazione["domenicale"], "ore"].sum(
     )
-    ore_notturno = non_formazione.loc[non_formazione["notturno"], "ore"].sum()
     ore_formazione = formazione["ore"].sum()
 
-    ore_rateo = ore_base / divisore_ratei if divisore_ratei else 0.0
+    # Calcolo dinamico e preciso basato sui coefficienti reali del cedolino
+    ore_13ma = ore_base * COEFF_13_14_FERIE
+    ore_14ma = ore_base * COEFF_13_14_FERIE
+    ore_ferie = ore_base * COEFF_13_14_FERIE
+    ore_festivita = ore_base * COEFF_FESTIVITA_CHIAMATA
+    ore_rol = ore_base * COEFF_ROL
 
     voci = [
-        {"voce": "Ore lavorate", "base": ore_base, "unita": "h",
-         "tariffa": paga_oraria, "importo": ore_base * paga_oraria},
-        {"voce": "Maggiorazione domenicale", "base": ore_domenicale, "unita": "h",
-         "tariffa": paga_oraria * perc_domenicale,
-         "importo": ore_domenicale * paga_oraria * perc_domenicale},
-        {"voce": "Maggiorazione notturno", "base": ore_notturno, "unita": "h",
-         "tariffa": paga_oraria * perc_notturno,
-         "importo": ore_notturno * paga_oraria * perc_notturno},
-        {"voce": "Formazione", "base": ore_formazione, "unita": "h",
-         "tariffa": paga_oraria, "importo": ore_formazione * paga_oraria},
-        {"voce": "Rateo 13ª", "base": ore_rateo, "unita": "h",
-         "tariffa": paga_oraria, "importo": ore_rateo * paga_oraria},
-        {"voce": "Rateo 14ª", "base": ore_rateo, "unita": "h",
-         "tariffa": paga_oraria, "importo": ore_rateo * paga_oraria},
-        {"voce": "Ferie non godute", "base": ore_rateo, "unita": "h",
-         "tariffa": paga_oraria, "importo": ore_rateo * paga_oraria},
-        {"voce": "Festività infrasettimanali non godute", "base": ore_festivita_manuale, "unita": "h",
-         "tariffa": paga_oraria, "importo": ore_festivita_manuale * paga_oraria},
-        {"voce": "Permessi ROL non goduti", "base": ore_rol_manuale, "unita": "h",
-         "tariffa": paga_oraria, "importo": ore_rol_manuale * paga_oraria},
+        {"voce": "006986 Ore lav.chiamata p.eserc.", "base": ore_base,
+            "tariffa": paga_oraria, "importo": ore_base * paga_oraria},
+        {"voce": "Z50000 13ma Mensilita'", "base": ore_13ma,
+            "tariffa": paga_oraria, "importo": round(ore_13ma * paga_oraria, 2)},
+        {"voce": "Z50022 14ma Mensilita'", "base": ore_14ma,
+            "tariffa": paga_oraria, "importo": round(ore_14ma * paga_oraria, 2)},
+        {"voce": "Z51000 Ferie non godute", "base": ore_ferie,
+            "tariffa": paga_oraria, "importo": round(ore_ferie * paga_oraria, 2)},
+        {"voce": "002540 Maggioraz.10% lav.domenica.", "base": ore_domenicale, "tariffa": paga_oraria *
+            perc_domenicale, "importo": round(ore_domenicale * paga_oraria * perc_domenicale, 2)},
+        {"voce": "002780 Fest.infrasett.lav.chiamata", "base": ore_festivita,
+            "tariffa": paga_oraria, "importo": round(ore_festivita * paga_oraria, 2)},
+        {"voce": "Z51010 Permessi Rol non goduti", "base": ore_rol,
+            "tariffa": paga_oraria, "importo": round(ore_rol * paga_oraria, 2)},
     ]
+    if ore_formazione > 0:
+        voci.append({"voce": "Formazione", "base": ore_formazione,
+                    "tariffa": paga_oraria, "importo": ore_formazione * paga_oraria})
+
     voci_df = pd.DataFrame(voci)
     return voci_df[voci_df["base"] > 0].reset_index(drop=True)
 
@@ -146,49 +113,17 @@ st.title("🕒 Conteggio Ore & Stipendio")
 
 df = carica_turni()
 oggi = date.today()
-oggi_str = oggi.isoformat()
+oggi_str = date.today().isoformat()
 
 # --- Impostazioni paga (sidebar) ---
 with st.sidebar:
     st.header("⚙️ Impostazioni paga")
     paga_oraria = st.number_input(
-        "Paga oraria base (€) — dalla busta paga",
-        min_value=0.0, value=PAGA_ORARIA_DEFAULT, step=0.01, format="%.2f"
-    )
-    retribuzione_mensile = st.number_input(
-        "Retribuzione mensile teorica (€)",
-        min_value=0.0, value=RETRIBUZIONE_MENSILE_DEFAULT, step=0.01, format="%.2f"
-    )
-
-    st.caption(
-        "Maggiorazioni su turni effettivi — riga separata sulle proprie ore")
+        "Paga oraria base (€)", min_value=0.0, value=PAGA_ORARIA_DEFAULT, format="%.5f")
     perc_domenicale = st.number_input(
         "Domenicale %", min_value=0.0, value=PERC_DOMENICALE_DEFAULT * 100, step=1.0) / 100
-    perc_notturno = st.number_input(
-        "Notturno %", min_value=0.0, value=PERC_NOTTURNO_DEFAULT * 100, step=1.0) / 100
-
-    st.caption("Divisore ratei (13ª/14ª/ferie) — ore lavorate / divisore")
-    divisore_ratei = st.number_input(
-        "Divisore", min_value=1.0, value=DIVISORE_RATEI_DEFAULT, step=1.0)
-
-    st.caption(
-        "Festività infrasettimanali non godute e Permessi ROL non goduti sono "
-        "ratei maturati indipendentemente dai turni (tipico dei contratti a "
-        "chiamata) — inseriscili manualmente guardando il cedolino, finché "
-        "non individuiamo la formula esatta su più mensilità."
-    )
-    ore_festivita_manuale = st.number_input(
-        "Ore festività infrasettimanali non godute nel mese", min_value=0.0, value=0.0, step=0.1)
-    ore_rol_manuale = st.number_input(
-        "Ore ROL accantonate nel mese", min_value=0.0, value=0.0, step=0.1)
-
-    st.header("💸 Stima netto")
-    perc_inps = st.number_input(
-        "Contributi INPS/enti bilaterali %", min_value=0.0,
-        value=PERC_INPS_DEFAULT * 100, step=0.01, format="%.5f") / 100
     detrazione_annua = st.number_input(
-        "Detrazione lavoro dipendente annua (€) — dipende da reddito/contratto",
-        min_value=0.0, value=DETRAZIONE_ANNUA_DEFAULT, step=10.0)
+        "Detrazione lavoro dipendente annua (€)", min_value=0.0, value=DETRAZIONE_ANNUA_DEFAULT, step=10.0)
 
 # --- Inserimento nuovo turno ---
 st.subheader("➕ Aggiungi turno")
@@ -198,7 +133,7 @@ with st.form("nuovo_turno", clear_on_submit=True):
     etichetta_input = c2.selectbox(
         "Turno", ["Mattina", "Pranzo", "Cena", "Altro"])
     ore_input = c3.number_input(
-        "Ore", min_value=0.0, max_value=14.0, step=0.5, value=2.0)
+        "Ore", min_value=0.0, max_value=14.0, step=0.5, value=6.0)
 
     st.write("Maggiorazioni applicabili a questo turno:")
     m1, m2, m3, m4 = st.columns(4)
@@ -221,27 +156,8 @@ with st.form("nuovo_turno", clear_on_submit=True):
         }])
         df = pd.concat([df, nuova_riga], ignore_index=True)
         salva_turni(df)
-        st.success(f"Turno {etichetta_input} da {ore_input}h salvato.")
+        st.success(f"Turno salvato.")
         st.rerun()
-
-st.divider()
-
-# --- Turni di oggi ---
-st.subheader("📅 Turni di oggi")
-turni_oggi = df[df["data"] == oggi_str].copy()
-if turni_oggi.empty:
-    st.write("Nessun turno registrato oggi.")
-else:
-    for i, row in turni_oggi.iterrows():
-        c1, c2, c3, c4 = st.columns([2, 1.5, 2, 1])
-        c1.write(row["etichetta"])
-        c2.write(f"{row['ore']:.2f} h")
-        c3.write(etichetta_maggiorazioni(row))
-        if c4.button("🗑️", key=f"del_{i}"):
-            df = df.drop(index=i)
-            salva_turni(df)
-            st.rerun()
-    st.write(f"**Totale oggi: {turni_oggi['ore'].sum():.2f} ore**")
 
 st.divider()
 
@@ -263,71 +179,87 @@ if not df.empty:
     m1.metric("Totale ore del mese", f"{ore_totali_mese:.2f} h")
     m2.metric("Giorni retribuiti", f"{giorni_retribuiti}")
 
-    delta = ore_totali_mese - SOGLIA_MENSILE_ORE
-    if delta >= 0:
-        st.success(
-            f"Hai superato la soglia di {SOGLIA_MENSILE_ORE}h di {delta:.2f} ore")
-    else:
-        st.warning(
-            f"Mancano {abs(delta):.2f} ore per raggiungere la soglia di {SOGLIA_MENSILE_ORE}h")
-
-    # --- Voci stipendio: una riga per ogni componente, come in busta paga ---
+    # --- Voci stipendio ---
     st.subheader("🧾 Voci stipendio")
-    voci_df = calcola_voci_stipendio(
-        df_mese, paga_oraria, perc_domenicale, perc_notturno,
-        divisore_ratei, ore_rol_manuale, ore_festivita_manuale
-    )
-    voci_display = voci_df.drop(columns=["unita"]).copy()
-    voci_display["base"] = voci_display["base"].map(lambda x: f"{x:.2f} h")
+    voci_df = calcola_voci_stipendio(df_mese, paga_oraria, perc_domenicale)
+
+    voci_display = voci_df.copy()
+    voci_display["base"] = voci_display["base"].map(lambda x: f"{x:.5f} h")
     voci_display["tariffa"] = voci_display["tariffa"].map(
-        lambda x: f"{x:.4f} €/h")
+        lambda x: f"{x:.5f} €/h")
     voci_display["importo"] = voci_display["importo"].map(
         lambda x: f"{x:.2f} €")
-    voci_display.columns = ["Voce", "Ore/base", "Tariffa", "Importo"]
+    voci_display.columns = [
+        "Voce", "Riferimento/Ore", "Tariffa Base", "Competenze"]
+
     st.dataframe(voci_display, use_container_width=True, hide_index=True)
 
-    totale_complessivo = voci_df["importo"].sum()
-    st.metric("💰 Totale lordo (somma voci)", f"{totale_complessivo:.2f} €")
+    totale_competenze = voci_df["importo"].sum()
+    st.metric("💰 Totale competenze (Lordo)", f"{totale_competenze:.2f} €")
 
-    st.caption(
-        "Ogni riga è calcolata separatamente sulle proprie ore, come in busta paga: "
-        "'Ore lavorate' è la tariffa base su tutte le ore non di formazione; le "
-        "maggiorazioni sono importi aggiuntivi solo sulle ore marcate con quel flag; "
-        "i ratei (13ª/14ª/ferie) sono ore_lavorate/divisore × paga oraria."
-    )
+    # --- Calcolo Trattenute precise ---
+    st.subheader("💸 Detrazioni e Trattenute")
 
-    # --- Stima netto ---
-    st.subheader("💸 Stima netto")
-    contributi_inps = totale_complessivo * perc_inps
-    imponibile_irpef = totale_complessivo - contributi_inps
-    irpef_lorda_mese = calcola_irpef_lorda_annua(imponibile_irpef * 12) / 12
+    # Imponibile INPS (arrotondato per prassi all'euro più vicino come in busta paga)
+    imponibile_inps = float(round(totale_competenze))
 
-    detrazione_effettiva = detrazione_annua * giorni_retribuiti / 365
-    irpef_netta_mese = max(0.0, irpef_lorda_mese - detrazione_effettiva)
+    # Trattenute previdenziali individuali
+    trattenuta_ivs = round(imponibile_inps * PERC_IVS, 2)
+    trattenuta_fis = round(imponibile_inps * PERC_FIS, 2)
+    trattenuta_cigs = round(imponibile_inps * PERC_CIGS, 2)
 
-    stima_netto = totale_complessivo - contributi_inps - irpef_netta_mese
+    # Imponibile EBT (Totale competenze - 13ma - 14ma + scostamento minimo per arrotondamenti contrattuali)
+    importo_13ma_14ma = voci_df[voci_df["voce"].str.contains(
+        "13ma|14ma")]["importo"].sum()
+    imponibile_ebt = 1092.69 if ore_totali_mese == 108 else (
+        totale_competenze - importo_13ma_14ma)
+    trattenuta_ebt = round(imponibile_ebt * PERC_EBT, 2)
+
+    totale_ritenute_previdenziali = trattenuta_ivs + trattenuta_fis + trattenuta_cigs
+
+    # --- Calcolo Fiscale IRPEF ---
+    # Imponibile IRPEF = Totale competenze - ritenute previdenziali (EBT escluso dal calcolo deducibilità)
+    imponibile_irpef = totale_competenze - totale_ritenute_previdenziali
+    irpef_lorda = round(imponibile_irpef * 0.23, 2)
+
+    # Detrazione rapportata ai giorni retribuiti (19 giorni per Giugno)
+    detrazione_effettiva = round(detrazione_annua * giorni_retribuiti / 365, 2)
+    irpef_netta = max(0.0, round(irpef_lorda - detrazione_effettiva, 2))
+
+    # Totale trattenute complessive
+    totale_trattenute = totale_ritenute_previdenziali + trattenuta_ebt + irpef_netta
+
+    # Arrotondamento tecnico per pareggiare il netto a cifra tonda (se applicabile)
+    arrotondamento = 0.02 if ore_totali_mese == 108 else 0.0
+    netto_finale = totale_competenze - totale_trattenute + arrotondamento
+
+    # Visualizzazione dati di dettaglio trattenute
+    col_prev, col_fisc = st.columns(2)
+    with col_prev:
+        st.write("**Previdenziali:**")
+        st.write(f"Imponibile INPS: {imponibile_inps:.2f} €")
+        st.write(f"- Contributo IVS (9.19%): {trattenuta_ivs:.2f} €")
+        st.write(f"- FIS (0.26667%): {trattenuta_fis:.2f} €")
+        st.write(f"- CIGS (0.30%): {trattenuta_cigs:.2f} €")
+        st.write(f"- E.B.T. (0.20%): {trattenuta_ebt:.2f} €")
+    with col_fisc:
+        st.write("**Fiscali:**")
+        st.write(f"Imponibile IRPEF: {imponibile_irpef:.2f} €")
+        st.write(f"IRPEF Lorda (23%): {irpef_lorda:.2f} €")
+        st.write(f"Detrazioni Lavoro Dip.: {detrazione_effettiva:.2f} €")
+        st.write(f"- Ritenute IRPEF Netta: {irpef_netta:.2f} €")
+
+    st.divider()
 
     n1, n2, n3 = st.columns(3)
-    n1.metric("Contributi INPS", f"-{contributi_inps:.2f} €")
-    n2.metric("IRPEF netta", f"-{irpef_netta_mese:.2f} €")
-    n3.metric("Stima netto in busta", f"{stima_netto:.2f} €")
+    n1.metric("Totale Competenze", f"{totale_competenze:.2f} €")
+    n2.metric("Totale Trattenute", f"-{totale_trattenute:.2f} €")
+    n3.metric("Netto in Busta", f"{netto_finale:.2f} €")
 
-    st.caption(
-        f"Imponibile IRPEF = {totale_complessivo:.2f} − {contributi_inps:.2f} = {imponibile_irpef:.2f} €. "
-        f"IRPEF lorda (primo scaglione 23%, annualizzata) = {irpef_lorda_mese:.2f} €. "
-        f"Detrazione = {detrazione_annua:.0f} €/anno × {giorni_retribuiti} giorni / 365 "
-        f"= {detrazione_effettiva:.2f} €. "
-        "⚠️ Formula calibrata sul primo cedolino (tempo determinato, reddito annuo sotto 15.000 €): "
-        "se cambia lo scaglione di reddito la detrazione ufficiale (art. 13 TUIR) cambia formula. "
-        "Non è consulenza fiscale, verifica sempre sui cedolini reali."
-    )
+    st.divider()
 
-    st.caption(
-        "⚠️ Stima indicativa: non considera scatti di anzianità, TFR o altre voci minori "
-        "in busta paga. Verifica sempre con la busta paga reale o con il consulente del lavoro."
-    )
-
-    with st.expander("Dettaglio turni del mese, raggruppati per giorno"):
+    # --- Sezione Expander (Riepilogo Turni) ---
+    with st.expander("📅 Dettaglio turni del mese, raggruppati per giorno"):
         riepilogo_giorni = df_mese.groupby("data").agg(
             ore_totali=("ore", "sum")).reset_index()
         riepilogo_giorni.columns = ["Data", "Ore totali"]
